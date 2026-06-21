@@ -1,128 +1,171 @@
-# Claude Autonomous Task System
+# Autonomous Agent Task Runner
 
-Runs Claude Code on your PC during unused Anthropic usage windows, triggered and reported via Telegram.
-Everything runs locally — no cloud hosting needed, no API key needed.
+Runs an AI agent (Copilot CLI or Claude Code) on your PC to process pending tasks from `tasks.md`.
+Triggered hourly via Telegram, with automatic fallback to agent mode if you don't respond within 30 minutes.
+Works on **Windows** (Task Scheduler) and **Linux** (systemd).
+
+No cloud hosting needed, everything runs locally.
 
 ---
 
 ## Architecture
 
 ```
-Windows Task Scheduler (hourly)
+Hourly trigger (Telegram notification)
         │
         ▼
   bot/ (local process)
-  POST http://localhost:8080/session-start
+  POST /session-start
         │
         ▼
   Telegram message → you
         │
-        ├── you reply "yes"  → bot cancels timer, does nothing
+        ├── "yes"  → cancels timer, agent idle
         │
-        └── 30 min timeout / no reply
+        └── "no" or 30 min timeout
                 │
                 ▼
           POST http://localhost:3333/run
                 │
                 ▼
-          pc-server/ (local process)
-          orchestrator reads tasks.md
-          cd to project path
-          claude -p "task" --dangerously-skip-permissions
+          pc-server/ orchestrator
+          │
+          ├─ read tasks.md
+          ├─ expand paths (~ and ${VAR})
+          ├─ sort by priority
+          │
+          └─ for each task:
+              ├─ cd to project path
+              ├─ spawn agent (copilot or claude)
+              ├─ mark [x] when done
+              ├─ git commit
+              └─ next task
                 │
                 ▼
-          mark task [x] done
-          git commit
-          loop → next task
-                │
-                ▼
-          Telegram summary sent
+          Telegram summary + cost
 ```
-
-All processes run as Windows scheduled tasks and start automatically on login.
 
 ---
 
-## Prerequisites
+## Supported Platforms
 
-### 1. Node.js
-Download and install from [nodejs.org](https://nodejs.org) (LTS version).
-Verify: `node -v` should print v22 or higher.
+- **Windows** — Task Scheduler auto-start + hourly schtask
+- **Linux** (Ubuntu, Arch, Debian, Fedora) — systemd user services + timer
+- **macOS** — same as Linux (systemd)
 
-### 2. Claude Code
-```powershell
-npm install -g @anthropic-ai/claude-code
+---
+
+## Prerequisites: Choose Your Agent
+
+Choose one (not both):
+
+### Option A: Copilot CLI (recommended default)
+```bash
+npm install -g @microsoft/copilot
+copilot login
 ```
 
-### 3. Log in to Claude Code
-Claude Code uses your claude.ai Pro subscription — no API key needed.
+Headless: `copilot -p "your prompt" --allow-all-tools` (exit 0 = success)
 
-```powershell
+### Option B: Claude Code
+```bash
+npm install -g @anthropic-ai/claude-code
 claude login
 ```
 
-Follow the browser prompt to authenticate with your Anthropic account.
-Verify it works:
-
-```powershell
-claude -p "say hello" --allowedTools "Bash"
-```
-
-If it responds without asking for an API key, you're good.
-
-### 4. Telegram Bot + Chat ID
-1. Message [@BotFather](https://t.me/BotFather) on Telegram
-2. `/newbot` → follow prompts → copy the **bot token** (`123456789:ABC-...`)
-3. Start a conversation with your new bot (send it any message)
-4. Open in browser (replace token): `https://api.telegram.org/bot<TOKEN>/getUpdates`
-5. Find `"chat":{"id":XXXXXXXXX}` — that number is your **chat ID**
+Headless: `claude -p "your prompt" --output-format json` (exit 0 + no `is_error` = success)
 
 ---
 
-## Setup
+## Setup: Linux
 
-### 1. Create bot/.env
+### 1. Build both packages
 
-Create the file `bot/.env` with your values:
-
-```env
-TELEGRAM_BOT_TOKEN=123456789:ABC-your-token-here
-TELEGRAM_CHAT_ID=1534788927
-PC_WEBHOOK_URL=http://localhost:3333
-TIMEOUT_MINUTES=30
-CRON_PORT=8080
+```bash
+cd pc-server && npm install && npm run build
+cd ../bot && npm install && npm run build
 ```
 
-`PC_WEBHOOK_URL` points to localhost because bot and pc-server run on the same machine.
+### 2. Create `.env` files
 
-### 2. Build both packages
+```bash
+cp pc-server/.env.example pc-server/.env
+cp bot/.env.example bot/.env
+```
+
+Edit both:
+- `pc-server/.env`: Set `AGENT_CLI` (copilot|claude) and `PROJECTS_ROOT`
+- `bot/.env`: Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
+
+### 3. Run systemd installer
+
+```bash
+bash scripts/linux/install.sh
+```
+
+This will:
+- Copy systemd units to `~/.config/systemd/user/`
+- Enable and start `pc-server`, `bot`, and `session-trigger.timer`
+- Enable lingering so services persist while logged off
+
+### 4. Verify
+
+```bash
+systemctl --user status pc-server
+systemctl --user status bot
+systemctl --user list-timers session-trigger.timer
+journalctl --user -u pc-server -f  # tail logs
+```
+
+### 5. Test end-to-end
+
+```bash
+curl -X POST http://localhost:3333/status
+curl -X POST http://localhost:8080/session-start  # should send Telegram
+```
+
+---
+
+## Setup: Windows
+
+### 1. Build both packages
 
 ```powershell
 cd pc-server
 npm install
 npm run build
 
-cd ../bot
+cd ..\bot
 npm install
 npm run build
 ```
 
-### 3. Register startup tasks (run once as Administrator)
+### 2. Create `.env` files
 
 ```powershell
-cd C:\Users\ofek\Downloads\gitRepos\ClaudeToDoAutomation\scripts
-.\register-startup.bat   # right-click → Run as Administrator
+copy pc-server\.env.example pc-server\.env
+copy bot\.env.example bot\.env
 ```
 
-This registers three Windows Task Scheduler jobs under `ClaudeAutonomous\`:
+Edit both:
+- `pc-server\.env`: Set `AGENT_CLI` (copilot|claude) and `PROJECTS_ROOT`
+- `bot\.env`: Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
 
-| Task | What it runs | When |
+### 3. Register Task Scheduler jobs (Administrator required)
+
+```powershell
+# Right-click scripts\windows\register-startup.bat → Run as Administrator
+```
+
+This registers three jobs under `ClaudeAutonomous\`:
+
+| Task | Trigger | What it runs |
 |---|---|---|
-| `PCServer` | `node pc-server/dist/index.js` | On login, after 30s |
-| `Bot` | `node bot/dist/index.js` | On login, after 60s |
-| `SessionTrigger` | `curl -X POST http://localhost:8080/session-start` | Hourly |
+| `PCServer` | On login (+30s) | `node pc-server/dist/index.js` |
+| `Bot` | On login (+60s) | `node bot/dist/index.js` |
+| `SessionTrigger` | Hourly at :05 | `curl POST /session-start` |
 
-### 4. Start tasks immediately (without rebooting)
+### 4. Start tasks immediately
 
 ```powershell
 schtasks /Run /TN "ClaudeAutonomous\PCServer"
@@ -132,64 +175,165 @@ schtasks /Run /TN "ClaudeAutonomous\Bot"
 ### 5. Test end-to-end
 
 ```powershell
-# Confirm pc-server is up
-curl http://localhost:3333/status
-
-# Trigger a session manually — should send you a Telegram message
-curl -X POST http://localhost:8080/session-start
+Invoke-RestMethod -Uri http://localhost:3333/status
+Invoke-RestMethod -Uri http://localhost:8080/session-start -Method POST  # should send Telegram
 ```
-
-Reply `yes` to the Telegram message to cancel, or wait 30 minutes (lower `TIMEOUT_MINUTES` for testing).
 
 ---
 
-## Adding tasks
+## Configure PROJECTS_ROOT
+
+The path variable `${PROJECTS_ROOT}` in `tasks.md` must be set in your environment:
+
+**Linux/macOS:**
+```bash
+export PROJECTS_ROOT=$HOME/repositories
+# or in pc-server/.env:
+PROJECTS_ROOT=/home/user/repositories
+```
+
+**Windows:**
+```powershell
+$env:PROJECTS_ROOT = "C:\Users\YourName\repositories"
+# or in pc-server\.env:
+PROJECTS_ROOT=C:\Users\YourName\repositories
+```
+
+---
+
+## Adding Tasks
 
 Edit `tasks.md`. Format:
 
 ```markdown
-## project: my-project
-path: C:\Users\ofek\projects\my-project
-context: Brief one-line description of the tech stack
+## project: biomarkers
+path: ${PROJECTS_ROOT}/biomarker-pipeline
+context: Python bioinformatics pipeline
 
-- [ ] do something specific | priority: high
-- [ ] another task | priority: medium
-- [ ] low effort cleanup | priority: low
+- [ ] implement new feature | priority: high
+- [ ] refactor tests | priority: medium
+- [ ] update docs | priority: low
 ```
 
-Tasks are sorted by priority across all projects — `high` always runs first regardless of project.
-The orchestrator marks tasks `[x]` when done and commits `tasks.md` automatically.
+**Rules:**
+- `path:` supports `~` (home dir) and `${VARIABLE}` expansion
+- Tasks are sorted by priority (`high` → `medium` → `low`)
+- Orchestrator auto-marks tasks `[x]` and commits `tasks.md`
 
 ---
 
-## Telegram commands
+## Telegram Commands
 
 | Message | Action |
 |---|---|
-| `yes` | Claim the session — cancels the timer, agent stays idle |
-| `/run` | Start the agent manually right now |
-| `/stop` | Gracefully stop a running session after current task |
+| `yes` | Claim the session — cancels timer, agent idles |
+| `no` | Start agent now (don't wait 30 min) |
+| `/run` | Start agent manually right now |
+| `/stop` | Gracefully stop a running session |
 | `/status` | Check if agent is running |
 | `/help` | Show command list |
 
 ---
 
+## Running Locally (Debug)
+
+**Linux:**
+```bash
+export AGENT_CLI=copilot
+export PROJECTS_ROOT=~/repositories
+node pc-server/dist/index.js
+
+# In another terminal:
+curl -X POST http://localhost:3333/run
+```
+
+**Windows:**
+```powershell
+$env:AGENT_CLI = "copilot"
+$env:PROJECTS_ROOT = "C:\Users\YourName\repositories"
+node pc-server/dist/index.js
+
+# In another PowerShell:
+Invoke-RestMethod -Uri http://localhost:3333/run -Method POST
+```
+
+---
+
 ## Troubleshooting
 
-**Bot doesn't send a Telegram message**
-- Check bot is running: `schtasks /Query /TN "ClaudeAutonomous\Bot"`
-- Verify `bot/.env` has the correct token and chat ID
-- Test manually: `curl -X POST http://localhost:8080/session-start`
+**Telegram bot doesn't send messages**
+- Verify `bot/.env` has correct `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
+- Check bot process is running: `systemctl --user status bot` (Linux) or Task Scheduler (Windows)
+- Test: `curl -X POST http://localhost:8080/session-start`
 
-**pc-server not reachable**
-- Check it's running: `curl http://localhost:3333/status`
-- Start manually: `node pc-server/dist/index.js`
+**PC Server not responding**
+- Verify it's running: `curl http://localhost:3333/status`
+- Check logs: `journalctl --user -u pc-server -f` (Linux) or logs file (Windows)
 
-**Claude Code fails inside a task**
-- Confirm you're logged in: `claude login`
-- Test headless mode: `claude -p "list files" --allowedTools "Bash"`
-- Check the project path in `tasks.md` exists and is a valid git repo
+**Agent fails on tasks**
+- Verify you're logged in: `copilot -p "test" --allow-all-tools` or `claude -p "test"`
+- Confirm project paths in `tasks.md` exist and `${PROJECTS_ROOT}` is set correctly
+- Check agent permissions: `AGENT_CLI=copilot` (Copilot) or `AGENT_CLI=claude` (Claude)
 
-**Scheduled tasks not starting on login**
-- Open Task Scheduler → `ClaudeAutonomous\` folder → check Last Run Result
-- Re-run `register-startup.bat` as Administrator if tasks are missing
+**Path variable not expanding**
+- Ensure `PROJECTS_ROOT` is set: `echo $PROJECTS_ROOT` (Linux) or `echo $env:PROJECTS_ROOT` (Windows)
+- If using `pc-server/.env`, verify the file exists and process reloads it
+
+**Linux systemd not starting**
+- Check status: `systemctl --user status pc-server`
+- View logs: `journalctl --user -u pc-server -n 50`
+- Re-run installer: `bash scripts/linux/install.sh`
+
+**Windows Task Scheduler job doesn't run**
+- Verify job exists: `schtasks /Query /TN "ClaudeAutonomous\PCServer"`
+- Check last run result: right-click job → Properties → History
+- Re-register: right-click `scripts\windows\register-startup.bat` → Run as Administrator
+
+---
+
+## Choosing: Copilot vs. Claude
+
+| | Copilot CLI | Claude CLI |
+|---|---|---|
+| **Installation** | `npm i -g @microsoft/copilot` | `npm i -g @anthropic-ai/claude-code` |
+| **Headless mode** | `copilot -p "..."` | `claude -p "..." --output-format json` |
+| **Success indicator** | exit 0 | exit 0 + no `is_error` in JSON |
+| **Cost visibility** | No | Yes (`$cost_usd` per task) |
+| **OS support** | Linux, macOS, Windows | Linux, macOS, Windows |
+
+**Default:** `AGENT_CLI=copilot`
+**To switch:** Change `AGENT_CLI=claude` in `pc-server/.env` or environment
+
+---
+
+## Advanced: Custom Instructions
+
+Copilot and Claude support `.instructions.md` files for custom context:
+
+1. Create `.instructions.md` at repo root
+2. Add project guidelines, build commands, conventions
+3. Agent will read it automatically
+
+Example:
+```markdown
+# Build & Test
+- Build: `npm run build`
+- Test: `npm test`
+- Lint: `npm run lint`
+
+# Code Style
+- Use ES6+ syntax
+- Max line length: 100
+- 2 spaces indentation
+```
+
+---
+
+## Architecture Files
+
+- `pc-server/src/orchestrator.ts` — task parser, path expansion, agent spawn
+- `pc-server/src/index.ts` — HTTP server (POST /run, /stop, GET /status)
+- `bot/src/index.ts` — Telegram polling + cron webhook
+- `tasks.md` — task queue (you edit this)
+- `scripts/linux/` — systemd units + installer
+- `scripts/windows/` — Task Scheduler scripts

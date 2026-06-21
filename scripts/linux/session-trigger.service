@@ -1,0 +1,11 @@
+[Unit]
+Description=Trigger autonomous session (hourly)
+After=network.target bot.service
+
+[Service]
+Type=oneshot
+User=%u
+ExecStart=/usr/bin/curl -s -X POST http://localhost:8080/session-start
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=session-trigger

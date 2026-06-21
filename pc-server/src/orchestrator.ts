@@ -1,9 +1,14 @@
 import { spawnSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
+import * as os from "os";
 
 // tasks.md lives at the repo root, two levels above pc-server/dist/
 const TASKS_FILE = path.resolve(__dirname, "../../tasks.md");
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
+const AGENT_CLI = process.env.AGENT_CLI ?? "copilot"; // "copilot" or "claude"
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -21,6 +26,153 @@ interface RunResult {
   skipped: number;
   tasks: string[];
   errors: string[];
+}
+
+interface SpawnConfig {
+  cmd: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+}
+
+interface AgentResult {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+// ─── Path expansion ──────────────────────────────────────────────────────────
+
+function expandPath(rawPath: string): string {
+  // Expand leading ~
+  if (rawPath.startsWith("~")) {
+    rawPath = rawPath.replace("~", os.homedir());
+  }
+
+  // Expand ${VAR} tokens from process.env
+  rawPath = rawPath.replace(/\$\{([^}]+)\}/g, (match, varName) => {
+    const value = process.env[varName];
+    if (value === undefined) {
+      console.warn(`[orchestrator] Warning: env var not set: ${varName}`);
+      return match; // leave as-is if not found
+    }
+    return value;
+  });
+
+  return rawPath;
+}
+
+// ─── Agent command builder ────────────────────────────────────────────────────
+
+function buildAgentCommand(
+  prompt: string,
+  agentCli: string,
+  platform: string
+): SpawnConfig {
+  const spawnEnv = { ...process.env, AGENT_PROMPT: prompt };
+
+  if (agentCli === "claude") {
+    if (platform === "win32") {
+      // Windows: use PowerShell to pass prompt via env var
+      return {
+        cmd: "powershell.exe",
+        args: [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          "claude -p $env:AGENT_PROMPT --dangerously-skip-permissions --allowedTools 'Read,Write,Edit,Bash,Glob,Grep' --max-turns 20 --output-format json",
+        ],
+        env: spawnEnv,
+      };
+    } else {
+      // Linux/macOS: direct spawn
+      return {
+        cmd: "claude",
+        args: [
+          "-p",
+          prompt,
+          "--dangerously-skip-permissions",
+          "--allowedTools",
+          "Read,Write,Edit,Bash,Glob,Grep",
+          "--max-turns",
+          "20",
+          "--output-format",
+          "json",
+        ],
+        env: spawnEnv,
+      };
+    }
+  } else if (agentCli === "copilot") {
+    if (platform === "win32") {
+      // Windows: use PowerShell to pass prompt via env var
+      return {
+        cmd: "powershell.exe",
+        args: [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          "copilot -p $env:AGENT_PROMPT --allow-all-tools",
+        ],
+        env: spawnEnv,
+      };
+    } else {
+      // Linux/macOS: direct spawn
+      return {
+        cmd: "copilot",
+        args: ["-p", prompt, "--allow-all-tools"],
+        env: spawnEnv,
+      };
+    }
+  } else {
+    throw new Error(`Unknown agent CLI: ${agentCli}`);
+  }
+}
+
+// ─── Result evaluation ────────────────────────────────────────────────────────
+
+function evaluateResult(result: AgentResult, agentCli: string): boolean {
+  // Check for spawn errors
+  if (result.status === null) {
+    return false;
+  }
+
+  if (result.status !== 0) {
+    console.error(`[orchestrator] ✗ agent exited ${result.status}`);
+    console.error(result.stderr);
+    return false;
+  }
+
+  if (agentCli === "copilot") {
+    // Copilot CLI: success is just exit 0
+    console.log(`[orchestrator] stdout: ${result.stdout.slice(0, 2000)}`);
+    if (result.stderr) console.log(`[orchestrator] stderr: ${result.stderr.slice(0, 500)}`);
+    return true;
+  } else if (agentCli === "claude") {
+    // Claude CLI: parse JSON output and check is_error
+    console.log(`[orchestrator] stdout: ${result.stdout.slice(0, 2000)}`);
+    if (result.stderr) console.log(`[orchestrator] stderr: ${result.stderr.slice(0, 500)}`);
+
+    if (!result.stdout || !result.stdout.trim()) {
+      console.error(`[orchestrator] ✗ no output from claude (command may not have run)`);
+      return false;
+    }
+
+    try {
+      const out = JSON.parse(result.stdout);
+      if (out.is_error) {
+        console.error(`[orchestrator] ✗ claude reported an error: ${JSON.stringify(out)}`);
+        return false;
+      }
+      console.log(
+        `[orchestrator] ✓ done — ${out.num_turns ?? "?"} turns, $${out.cost_usd?.toFixed(4) ?? "?"}`
+      );
+      return true;
+    } catch {
+      console.error(`[orchestrator] ✗ failed to parse claude output: ${result.stdout.slice(0, 500)}`);
+      return false;
+    }
+  }
+
+  return false;
 }
 
 // ─── Parser ───────────────────────────────────────────────────────────────────
@@ -49,7 +201,7 @@ export function parseTasks(): Task[] {
 
     const pathMatch = line.match(/^path:\s*(.+)/);
     if (pathMatch) {
-      currentPath = pathMatch[1].trim();
+      currentPath = expandPath(pathMatch[1].trim());
       continue;
     }
 
@@ -109,59 +261,27 @@ function runTask(task: Task, stopSignal: { stop: boolean }): "ok" | "stopped" | 
     return "error";
   }
 
-  // On Windows, pass the prompt via an env var to avoid cmd.exe quoting issues.
-  // PowerShell reads $env:CLAUDE_PROMPT so no shell-escaping of the prompt is needed.
-  const spawnEnv = { ...process.env, CLAUDE_PROMPT: prompt };
+  const spawnConfig = buildAgentCommand(prompt, AGENT_CLI, process.platform);
 
-  const result = process.platform === "win32"
-    ? spawnSync(
-        "powershell.exe",
-        [
-          "-NoProfile", "-NonInteractive", "-Command",
-          "claude -p $env:CLAUDE_PROMPT --dangerously-skip-permissions --allowedTools 'Read,Write,Edit,Bash,Glob,Grep' --max-turns 20 --output-format json",
-        ],
-        { cwd: task.projectPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8", shell: false, env: spawnEnv }
-      )
-    : spawnSync(
-        "claude",
-        ["-p", prompt, "--dangerously-skip-permissions", "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep", "--max-turns", "20", "--output-format", "json"],
-        { cwd: task.projectPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8", shell: false, env: spawnEnv }
-      );
+  const result = spawnSync(spawnConfig.cmd, spawnConfig.args, {
+    cwd: task.projectPath,
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf-8",
+    shell: false,
+    env: spawnConfig.env,
+  });
 
   if (result.error) {
     console.error(`[orchestrator] ✗ spawn error: ${result.error.message}`);
     return "error";
   }
 
-  if (result.status !== 0) {
-    console.error(`[orchestrator] ✗ claude exited ${result.status}`);
-    console.error(result.stderr);
-    return "error";
-  }
+  const success = evaluateResult(
+    { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" },
+    AGENT_CLI
+  );
 
-  console.log(`[orchestrator] stdout: ${result.stdout.slice(0, 2000)}`);
-  console.log(`[orchestrator] stderr: ${result.stderr.slice(0, 500)}`);
-
-  if (!result.stdout || !result.stdout.trim()) {
-    console.error(`[orchestrator] ✗ no output from claude (command may not have run)`);
-    return "error";
-  }
-
-  try {
-    const out = JSON.parse(result.stdout);
-    if (out.is_error) {
-      console.error(`[orchestrator] ✗ claude reported an error: ${JSON.stringify(out)}`);
-      return "error";
-    }
-    console.log(
-      `[orchestrator] ✓ done — ${out.num_turns ?? "?"} turns, $${out.cost_usd?.toFixed(4) ?? "?"}`
-    );
-  } catch {
-    console.error(`[orchestrator] ✗ failed to parse claude output: ${result.stdout.slice(0, 500)}`);
-    return "error";
-  }
-
-  return "ok";
+  return success ? "ok" : "error";
 }
 
 // ─── Main loop ────────────────────────────────────────────────────────────────
@@ -176,6 +296,7 @@ export async function runAll(stopSignal: { stop: boolean }): Promise<RunResult> 
   }
 
   console.log(`[orchestrator] Found ${tasks.length} pending task(s).`);
+  console.log(`[orchestrator] Using agent: ${AGENT_CLI}`);
 
   for (const task of tasks) {
     if (stopSignal.stop) {

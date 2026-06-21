@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly session trigger timer
+Documentation=file://%REPO%/README.md
+
+[Timer]
+OnCalendar=*-*-* *:05:00
+Persistent=true
+Unit=session-trigger.service
+
+[Install]
+WantedBy=timers.target

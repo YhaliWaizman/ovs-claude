@@ -1,0 +1,21 @@
+[Unit]
+Description=Telegram Bot for Autonomous Agent
+Documentation=file://%REPO%/README.md
+After=network.target pc-server.service
+Wants=pc-server.service
+
+[Service]
+Type=simple
+User=%u
+WorkingDirectory=%REPO%/bot
+EnvironmentFile=%REPO%/bot/.env
+Environment="NODE_ENV=production"
+ExecStart=/usr/bin/node %REPO%/bot/dist/index.js
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bot
+
+[Install]
+WantedBy=default.target

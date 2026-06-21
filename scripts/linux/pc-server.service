@@ -1,0 +1,21 @@
+[Unit]
+Description=Claude Autonomous PC Server
+Documentation=file://%REPO%/README.md
+After=network.target
+
+[Service]
+Type=simple
+User=%u
+WorkingDirectory=%REPO%/pc-server
+EnvironmentFile=%REPO%/pc-server/.env
+Environment="AGENT_CLI=copilot"
+Environment="NODE_ENV=production"
+ExecStart=/usr/bin/node %REPO%/pc-server/dist/index.js
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pc-server
+
+[Install]
+WantedBy=default.target

@@ -1,5 +1,10 @@
+import dotenv from "dotenv";
+import path from "path";
 import http from "http";
 import { runAll } from "./orchestrator";
+
+// Load .env from pc-server/.env if present
+dotenv.config({ path: path.resolve(__dirname, "../.env") });
 
 const ts = () => new Date().toISOString();
 const _log = console.log.bind(console);
