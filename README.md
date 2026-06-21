@@ -308,11 +308,12 @@ Invoke-RestMethod -Uri http://localhost:3333/run -Method POST
 
 ## Advanced: Custom Instructions
 
-Copilot and Claude support `.instructions.md` files for custom context:
+Native Copilot configuration is included in this repo:
 
-1. Create `.instructions.md` at repo root
-2. Add project guidelines, build commands, conventions
-3. Agent will read it automatically
+1. `.github/copilot-instructions.md`
+2. `.instructions.md`
+
+These files provide repo-specific behavior for Copilot IDE/CLI sessions, including cross-platform rules, task format constraints, and validation expectations.
 
 Example:
 ```markdown
